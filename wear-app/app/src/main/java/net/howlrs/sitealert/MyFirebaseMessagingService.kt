@@ -10,16 +10,17 @@ import com.google.firebase.messaging.RemoteMessage
 class MyFirebaseMessagingService : FirebaseMessagingService() {
 
     override fun onMessageReceived(remoteMessage: RemoteMessage) {
-        val message = AlertMessage.fromData(remoteMessage.data, remoteMessage.messageId)
-        if (message == null) {
+        val receivedMessage = AlertMessage.fromData(remoteMessage.data, remoteMessage.messageId)
+        if (receivedMessage == null) {
             Log.w(TAG, "ignored message keys=${remoteMessage.data.keys}")
             return
         }
         val prefs = DevicePrefs(this)
-        if (!prefs.markAlertReceived(message.alertId)) {
-            Log.i(TAG, "duplicate alert ignored id=${message.alertId}")
+        if (!prefs.markAlertReceived(receivedMessage.alertId)) {
+            Log.i(TAG, "duplicate alert ignored id=${receivedMessage.alertId}")
             return
         }
+        val message = AlertNotificationState(this).assign(receivedMessage)
         Log.i(
             TAG,
             "alert received id=${message.alertId} type=${message.type.wire} " +

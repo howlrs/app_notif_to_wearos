@@ -11,6 +11,7 @@ data class AlertMessage(
     val siteId: Int?,
     val deviceId: Int?,
     val sentAt: String?,
+    val notificationId: Int = 0,
 ) {
     enum class Type(val wire: String) { ALERT("alert"), TEST("test") }
 
@@ -26,6 +27,7 @@ data class AlertMessage(
         .putExtra(EXTRA_SITE_ID, siteId ?: 0)
         .putExtra(EXTRA_DEVICE_ID, deviceId ?: 0)
         .putExtra(EXTRA_SENT_AT, sentAt)
+        .putExtra(EXTRA_NOTIFICATION_ID, notificationId)
 
     companion object {
         const val DEFAULT_TITLE = "警告"
@@ -37,6 +39,7 @@ data class AlertMessage(
         private const val EXTRA_SITE_ID = "net.howlrs.sitealert.extra.SITE_ID"
         private const val EXTRA_DEVICE_ID = "net.howlrs.sitealert.extra.DEVICE_ID"
         private const val EXTRA_SENT_AT = "net.howlrs.sitealert.extra.SENT_AT"
+        private const val EXTRA_NOTIFICATION_ID = "net.howlrs.sitealert.extra.NOTIFICATION_ID"
 
         /**
          * 未知の type は null を返して無視する。alert_id がなければ FCM の messageId で代用する。
@@ -65,6 +68,7 @@ data class AlertMessage(
                 siteId = intent.getIntExtra(EXTRA_SITE_ID, 0).takeIf { it > 0 },
                 deviceId = intent.getIntExtra(EXTRA_DEVICE_ID, 0).takeIf { it > 0 },
                 sentAt = intent.getStringExtra(EXTRA_SENT_AT),
+                notificationId = intent.getIntExtra(EXTRA_NOTIFICATION_ID, 0).takeIf { it > 0 } ?: return null,
             )
         }
     }

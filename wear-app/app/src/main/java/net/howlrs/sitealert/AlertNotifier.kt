@@ -11,8 +11,11 @@ import android.media.AudioAttributes
 import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import java.util.concurrent.FutureTask
 
 /**
  * 警告通知の組み立て（docs/02 §5.3）。
@@ -26,7 +29,6 @@ object AlertNotifier {
     const val CHANNEL_ID = "site_alert_v2"
     private val RETIRED_CHANNEL_IDS = listOf("site_alert_v1")
     const val FALLBACK_CHANNEL_ID = "site_alert_fallback_v1"
-    const val NOTIFICATION_ID = 1001
 
     /** 1 秒振動＋0.5 秒休止。AlertService はこれを確認まで繰り返す（D-04） */
     val VIBRATION_CYCLE = longArrayOf(0, 1000, 500)
@@ -71,15 +73,19 @@ object AlertNotifier {
     fun build(context: Context, message: AlertMessage, channelId: String, alerting: Boolean): Notification {
         val openAlert = PendingIntent.getActivity(
             context,
-            message.alertId.hashCode(),
+            0,
             message.putInto(Intent(context, AlertActivity::class.java))
+                .setData(alertUri(message.alertId, message.notificationId, "open"))
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val acknowledge = PendingIntent.getBroadcast(
             context,
             0,
-            Intent(context, AckReceiver::class.java),
+            Intent(context, AckReceiver::class.java)
+                .setData(alertUri(message.alertId, message.notificationId, "ack"))
+                .putExtra(AlertController.EXTRA_ALERT_ID, message.alertId)
+                .putExtra(AlertController.EXTRA_NOTIFICATION_ID, message.notificationId),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         return NotificationCompat.Builder(context, channelId)
@@ -102,10 +108,38 @@ object AlertNotifier {
     /** フォアグラウンドサービスを起動できない時の予備経路。音と振動は OS が 1 回鳴らす。 */
     @SuppressLint("MissingPermission")
     fun postFallback(context: Context, message: AlertMessage) {
-        val manager = NotificationManagerCompat.from(context)
-        if (!manager.areNotificationsEnabled()) return
-        manager.notify(NOTIFICATION_ID, build(context, message, FALLBACK_CHANNEL_ID, alerting = true))
+        val appContext = context.applicationContext
+        runOnMainThread {
+            val coordinator = AlertNotificationCoordinator(AlertNotificationState(appContext)) { notificationId ->
+                cancel(appContext, notificationId)
+            }
+            val replaced = coordinator.start(message)
+            if (replaced != null) AlertController.dismissReplaced(appContext, replaced)
+            val manager = NotificationManagerCompat.from(appContext)
+            if (manager.areNotificationsEnabled()) {
+                manager.notify(message.notificationId, build(appContext, message, FALLBACK_CHANNEL_ID, alerting = true))
+            }
+        }
     }
+
+    /** 確認・タイムアウトと直列化し、FCM のコールバックを通知掲示より先に完了させない。 */
+    private fun runOnMainThread(action: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            action()
+        } else {
+            val task = FutureTask<Unit> { action() }
+            check(Handler(Looper.getMainLooper()).post(task)) { "main looper is unavailable" }
+            task.get()
+        }
+    }
+
+    fun cancel(context: Context, notificationId: Int) =
+        NotificationManagerCompat.from(context).cancel(notificationId)
+
+    // extras と hashCode だけでは PendingIntent の識別にならない。完全な ID を URI の一要素にする。
+    private fun alertUri(alertId: String, notificationId: Int, operation: String): Uri =
+        Uri.Builder().scheme("sitealert").authority("alert")
+            .appendPath(alertId).appendPath(notificationId.toString()).appendPath(operation).build()
 
     /** Android 14 以降は通話・アラーム用途のアプリにだけ許可される（R-01） */
     fun canUseFullScreenIntent(context: Context): Boolean =

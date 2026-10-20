@@ -44,6 +44,9 @@ def main(argv: list[str] | None = None) -> int:
     send.add_argument("--dry-run", action="store_true", help="FCM で形式だけ検証し、端末には届けない")
 
     args = parser.parse_args(argv)
+    if args.command == "send" and args.type == ALERT and args.device is not None:
+        parser.error("--device は --type alert では指定できません（test 通知だけに使えます）")
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings = Settings.from_env()
     repository = DeviceRepository(settings.db_path)
