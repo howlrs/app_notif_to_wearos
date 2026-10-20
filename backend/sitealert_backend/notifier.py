@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -43,7 +44,7 @@ class NotifyResult:
 
 @dataclass(frozen=True)
 class SiteNotifyResult:
-    """現場への送信結果。status は sent（全台に送れた）/ partial / failed / not_registered。"""
+    """現場への送信結果。status は sent（全台が FCM に受け付けられた）/ partial / failed / not_registered。"""
 
     status: str
     alert_id: str
@@ -60,7 +61,7 @@ def build_message(
     title: str,
     body: str,
     sent_at: datetime,
-    ttl_seconds: int,
+    ttl_seconds: float,
 ) -> messaging.Message:
     """notification を含めない data メッセージを優先度 high で組み立てる。値はすべて文字列。
 
@@ -78,7 +79,11 @@ def build_message(
             "body": body,
             "sent_at": sent_at.isoformat(timespec="seconds"),
         },
-        android=messaging.AndroidConfig(priority="high", ttl=timedelta(seconds=ttl_seconds)),
+        # timedelta は float を最寄りのマイクロ秒へ丸めるため、切り上げずに残り時間を渡す。
+        android=messaging.AndroidConfig(
+            priority="high",
+            ttl=timedelta(microseconds=math.floor(ttl_seconds * 1_000_000)),
+        ),
     )
 
 
@@ -92,6 +97,7 @@ class Notifier:
         max_retries: int = 3,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc).astimezone(),
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._repository = repository
         self._send = send
@@ -99,6 +105,7 @@ class Notifier:
         self._max_retries = max_retries
         self._sleep = sleep
         self._clock = clock
+        self._monotonic_clock = monotonic_clock
 
     def notify_site(
         self,
@@ -115,6 +122,10 @@ class Notifier:
         device_id を指定するとその端末番号の時計だけに送る（キッティング時のテスト通知用）。
         同じ番号の時計が複数あれば、すべてに送る（D-14）。
         """
+        if message_type == ALERT and device_id is not None:
+            raise ValueError("alert notifications cannot specify device_id")
+
+        deadline = self._monotonic_clock() + self._ttl_seconds
         alert_id = alert_id or str(uuid.uuid4())
         devices = self._repository.list_site(site_id, device_id)
         if not devices:
@@ -125,7 +136,8 @@ class Notifier:
 
         sent_at = self._clock()
         results = [
-            self._notify_one(device, title, body, message_type, alert_id, sent_at) for device in devices
+            self._notify_one(device, title, body, message_type, alert_id, sent_at, deadline)
+            for device in devices
         ]
         sent = sum(result.status == "sent" for result in results)
         status = "sent" if sent == len(results) else "failed" if sent == 0 else "partial"
@@ -137,7 +149,14 @@ class Notifier:
         return SiteNotifyResult(status, alert_id, results)
 
     def _notify_one(
-        self, device: Device, title: str, body: str, message_type: str, alert_id: str, sent_at: datetime
+        self,
+        device: Device,
+        title: str,
+        body: str,
+        message_type: str,
+        alert_id: str,
+        sent_at: datetime,
+        deadline: float,
     ) -> NotifyResult:
         def result(status: str, **kwargs) -> NotifyResult:
             return NotifyResult(status, alert_id, device.watch_id, device.device_id, **kwargs)
@@ -150,20 +169,27 @@ class Notifier:
             )
             return result("token_invalid")
 
-        message = build_message(
-            device.fcm_token,
-            message_type=message_type,
-            alert_id=alert_id,
-            site_id=device.site_id,
-            device_id=device.device_id,
-            title=title,
-            body=body,
-            sent_at=sent_at,
-            ttl_seconds=self._ttl_seconds,
-        )
-
         attempts = 0
         while True:
+            remaining_seconds = deadline - self._monotonic_clock()
+            if remaining_seconds <= 0:
+                logger.error(
+                    "notification expired alert_id=%s watch=%s attempts=%s",
+                    alert_id, watch, attempts,
+                )
+                return result("failed", attempts=attempts, error="ttl_expired")
+
+            message = build_message(
+                device.fcm_token,
+                message_type=message_type,
+                alert_id=alert_id,
+                site_id=device.site_id,
+                device_id=device.device_id,
+                title=title,
+                body=body,
+                sent_at=sent_at,
+                ttl_seconds=remaining_seconds,
+            )
             attempts += 1
             try:
                 message_id = self._send(message)
@@ -182,6 +208,13 @@ class Notifier:
                     )
                     return result("failed", attempts=attempts, error=error.code)
                 delay = _retry_after_seconds(error) or 2 ** (attempts - 1)
+                remaining_seconds = deadline - self._monotonic_clock()
+                if delay >= remaining_seconds:
+                    logger.error(
+                        "retry deadline expired alert_id=%s watch=%s attempts=%s delay=%s remaining=%s",
+                        alert_id, watch, attempts, delay, remaining_seconds,
+                    )
+                    return result("failed", attempts=attempts, error="ttl_expired")
                 logger.warning("retrying alert_id=%s watch=%s in %ss code=%s", alert_id, watch, delay, error.code)
                 self._sleep(delay)
                 continue

@@ -1,9 +1,11 @@
 package net.howlrs.sitealert
 
-import android.app.NotificationManager
+import android.annotation.SuppressLint
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.media.Ringtone
 import android.media.RingtoneManager
@@ -17,6 +19,7 @@ import android.os.VibrationEffect
 import android.os.VibratorManager
 import android.util.Log
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 
 /**
  * 警告の鳴動を受け持つ短時間のフォアグラウンドサービス（docs/02 §5.4〜5.6、D-04）。
@@ -27,23 +30,59 @@ import androidx.core.app.ServiceCompat
 class AlertService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private val stopAfterLimit = Runnable { finishAlerting(keepNotification = true) }
-    private var currentMessage: AlertMessage? = null
+    private val session = AlertSession()
+    private var lastStartId = 0
     private var ringtone: Ringtone? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private val acknowledgeReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val alertId = intent.getStringExtra(AlertController.EXTRA_ALERT_ID)
+            val notificationId = intent.getIntExtra(AlertController.EXTRA_NOTIFICATION_ID, 0)
+            when (intent.action) {
+                AlertController.ACTION_ACKNOWLEDGE -> if (session.acknowledge(alertId, notificationId)) {
+                    finishAlerting(keepNotification = false)
+                }
+                AlertController.ACTION_DISMISS_REPLACED -> session.dismiss(alertId, notificationId)?.let { message ->
+                    finishAlerting(keepNotification = false, message = message)
+                }
+            }
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        ContextCompat.registerReceiver(
+            this,
+            acknowledgeReceiver,
+            IntentFilter().apply {
+                addAction(AlertController.ACTION_ACKNOWLEDGE)
+                addAction(AlertController.ACTION_DISMISS_REPLACED)
+            },
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        lastStartId = startId
         val message = intent?.let(AlertMessage::fromIntent)
         if (message == null) {
-            stopSelf()
+            if (session.currentMessage == null) stopSelf(startId)
             return START_NOT_STICKY
         }
-        currentMessage = message
+        // FGS が握る旧通知は cancel を受け付けないことがあるため、先にサービス側で除去する。
+        if (session.currentMessage != null) {
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        }
+        AlertNotificationCoordinator(AlertNotificationState(this)) { notificationId ->
+            AlertNotifier.cancel(this, notificationId)
+        }.start(message)
+        session.start(message)
         val notification = AlertNotifier.build(this, message, AlertNotifier.CHANNEL_ID, alerting = true)
         ServiceCompat.startForeground(
             this,
-            AlertNotifier.NOTIFICATION_ID,
+            message.notificationId,
             notification,
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE
@@ -86,18 +125,23 @@ class AlertService : Service() {
         wakeLock = null
     }
 
-    private fun finishAlerting(keepNotification: Boolean) {
+    @SuppressLint("MissingPermission")
+    private fun finishAlerting(keepNotification: Boolean, message: AlertMessage? = session.currentMessage) {
         stopSoundAndVibration()
-        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-        val message = currentMessage
-        if (keepNotification && message != null) {
-            getSystemService(NotificationManager::class.java).notify(
-                AlertNotifier.NOTIFICATION_ID,
+        val keepCurrent = keepNotification && message != null && AlertNotificationState(this).isCurrent(message)
+        // 残す通知は切り離す。REMOVE 後の同じ ID への再掲示は、遅延した削除に巻き込まれ得る。
+        ServiceCompat.stopForeground(
+            this,
+            if (keepCurrent) ServiceCompat.STOP_FOREGROUND_DETACH else ServiceCompat.STOP_FOREGROUND_REMOVE,
+        )
+        if (keepCurrent) {
+            androidx.core.app.NotificationManagerCompat.from(this).notify(
+                message.notificationId,
                 AlertNotifier.build(this, message, AlertNotifier.CHANNEL_ID, alerting = false),
             )
         }
         Log.i(TAG, "alerting finished keepNotification=$keepNotification")
-        stopSelf()
+        stopSelf(lastStartId)
     }
 
     /** shortService の制限時間（約 3 分）に達した時。通常は [MAX_ALERT_MILLIS] で先に止まる。 */
@@ -106,6 +150,7 @@ class AlertService : Service() {
     override fun onTimeout(startId: Int, fgsType: Int) = finishAlerting(keepNotification = true)
 
     override fun onDestroy() {
+        unregisterReceiver(acknowledgeReceiver)
         stopSoundAndVibration()
         super.onDestroy()
     }

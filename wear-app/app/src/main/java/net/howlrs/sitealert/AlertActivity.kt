@@ -46,8 +46,13 @@ class AlertActivity : ComponentActivity() {
         show(intent)
         setContent {
             MaterialTheme {
-                AlertScreen(message) {
-                    AlertController.acknowledge(this)
+                val displayedMessage = message
+                AlertScreen(displayedMessage) {
+                    AlertController.acknowledge(
+                        this,
+                        displayedMessage?.alertId,
+                        displayedMessage?.notificationId ?: 0,
+                    )
                     finish()
                 }
             }
