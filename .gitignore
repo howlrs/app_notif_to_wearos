@@ -1,0 +1,34 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+local.properties
+google-services.json
+*-firebase-adminsdk-*.json
+*service-account*.json
+*.jks
+*.keystore
+*.pem
+*.key
+
+# Local data, dependencies, and build outputs
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.db
+*.db-*
+*.sqlite*
+.gradle/
+.kotlin/
+build/
+*.apk
+*.aab
+*.log
+
+# Editor and operating system files
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
